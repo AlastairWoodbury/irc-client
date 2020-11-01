@@ -1,4 +1,5 @@
 from datetime import datetime
+
 from enums import Response
 
 __all__ = (
@@ -9,14 +10,17 @@ __all__ = (
 class ServerMessage:
     def __init__(
         self,
+        *,
         prefix: str,
         code: int,
         user: str,
-        params: str,
+        args: str = None,
+        params: str
     ) -> None:
         self.prefix = prefix
         self.code = Response(code)
         self.user = user
+        self.args = args or ''
         self.params = params.rstrip()
 
     def __str__(self):
@@ -29,12 +33,12 @@ class ServerMessage:
 class Message:
     def __init__(
         self,
+        *,
         nick: str,
         username: str,
         host: str,
         channel: str,
         message: str,
-        *,
         created_at: datetime = None
     ) -> None:
         self.nick = nick

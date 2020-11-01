@@ -1,14 +1,16 @@
 import asyncio
+import logging
 import re
+from typing import Callable
 
 from enums import Response
-from message import ServerMessage
+from message import Message, ServerMessage
 
 __all__ = (
     'Client'
 )
 
-SERVER_MESSAGE_RE = re.compile(r':(?P<prefix>.+) (?P<code>\d{3}|\w{1,2}) (?P<user>\w+) :(?P<params>.+)')
+SERVER_MESSAGE_RE = re.compile(r':(?P<prefix>[\w\.]+) (?P<code>\d{3}) (?P<user>\w+) (?P<args>.+)?:(?P<params>.+)')
 MESSAGE_RE = re.compile(r':(?P<nick>.+)!(?P<username>.+)@(?P<host>.+) PRIVMSG (?P<channel>.+) :(?P<message>.+)')
 
 
@@ -27,6 +29,8 @@ class Client:
         self.loop = loop or asyncio.get_event_loop()
 
         self._waiters = {}
+
+        self.logger = logging.getLogger(__name__)
 
     async def connect(
         self,
@@ -62,10 +66,15 @@ class Client:
         await self.set_nick(nick)
         await self.send_command('USER', args=f'{username} * *', params='turtle')
 
+        def check(message: ServerMessage):
+            return message.code == Response(1)
+
+        await self.wait_for('server_message', check=check, timeout=10)
+        self.logger.info('Logged in as %s', username)
+
     async def recieve_loop(self) -> None:
         while True:
             data = await self.reader.readuntil(b'\r\n')
-            print(f'< {data.decode().strip()}')
             self.loop.create_task(
                 self.handle_recieve(data)
             )
@@ -75,23 +84,54 @@ class Client:
         await self.dispatch('raw_socket_recieve', data)
 
     async def dispatch(self, event: str, *args, **kwargs) -> None:
-        func = getattr(self, f'on_{event}')
+        if waiters := self._waiters.get(event):
+            for waiter in waiters:
+                check = waiter[1]
+                if check(*args, **kwargs):
+                    waiter[0].set_result(*args, **kwargs)
+
+        func = getattr(self, f'on_{event}')  # TODO: Make this actually have a proper listener / event system
         await func(*args, **kwargs)
 
-    async def wait_for(self, code: Response, *, timeout: int = None) -> any:
-        print('heck')
+    async def wait_for(
+        self,
+        event: str,
+        *,
+        timeout: int = None,
+        check: Callable = None
+    ) -> any:
+        future = self.loop.create_future()
 
-    async def send_command(self, command: str, *, args: str = None, params: str = None) -> None:
+        if not self._waiters.get(event):
+            self._waiters[event] = []
+
+        if not check:
+            def _(*args, **kwargs) -> bool:
+                return True
+            check = _
+
+        self._waiters[event].append((future, check))
+        return await asyncio.wait_for(future, timeout)
+
+    async def send_command(
+        self,
+        command: str,
+        *,
+        args: str = None,
+        params: str = None
+    ) -> None:
         args = f'{args.strip()} ' if args else ''
         params = f':{params.strip()}' if params else ''
-        await self.send_raw(f'{command.strip()} {args}{params}\r\n'.encode())
+        message = f'{command.strip()} {args}{params}\r\n'
+        logging.debug('Sent command %s', message)
+        await self.send_raw(message.encode())
 
     async def send_raw(self, data: bytes) -> None:
-        print(f'> {data.decode().strip()}')
         self.writer.write(data)
         await self.writer.drain()
 
     async def on_raw_socket_recieve(self, message: str) -> None:
+
         if match := re.match(SERVER_MESSAGE_RE, message):  # Server message
             match_dict = match.groupdict()
             match_dict['code'] = int(match_dict['code'])
@@ -99,13 +139,16 @@ class Client:
             await self.dispatch('server_message', message)
 
         elif match := re.match(MESSAGE_RE, message):  # User message
-            await self.dispatch('message', match['message'])
+            await self.dispatch('message', Message(**match.groupdict()))
+        
+        else:
+            self.logger.warning('Recieved an unknown event: %s', message)
 
     async def on_server_message(self, message):
-        print(f'+ {message}')
+        self.logger.debug('Recieved server message %s', message)
 
-    async def on_message(self, message) -> None:
-        print(f'~ {message}')
+    async def on_message(self, message: Message) -> None:
+        self.logger.debug('[{0.created_at}] {0.channel} - {0.nick} | {0.message}'.format(message))
 
     async def close(self, reason: str = None) -> None:
         await self.send_command('QUIT', params=reason)
@@ -118,6 +161,12 @@ class Client:
 
     async def join_channel(self, name: str) -> None:
         await self.send_command('JOIN', args=name)
+
+        def check(message: Message) -> bool:
+            return message.code == Response(353)
+
+        message = await self.wait_for('server_message', check=check)
+        self.logger.info('Joined %s with %s members', name, len(message.params.split()))
 
     async def send_message(self, channel: str, message: str) -> None:
         await self.send_command('PRIVMSG', args=channel, params=message)
