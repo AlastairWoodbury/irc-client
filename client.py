@@ -123,7 +123,7 @@ class Client:
         args = f'{args.strip()} ' if args else ''
         params = f':{params.strip()}' if params else ''
         message = f'{command.strip()} {args}{params}\r\n'
-        logging.debug('Sent command %s', message)
+        logging.debug('Sent command %s', message.rstrip())
         await self.send_raw(message.encode())
 
     async def send_raw(self, data: bytes) -> None:
@@ -140,9 +140,9 @@ class Client:
 
         elif match := re.match(MESSAGE_RE, message):  # User message
             await self.dispatch('message', Message(**match.groupdict()))
-        
+
         else:
-            self.logger.warning('Recieved an unknown event: %s', message)
+            self.logger.warning('Recieved an unknown event: %s', message.rstrip())
 
     async def on_server_message(self, message):
         self.logger.debug('Recieved server message %s', message)
