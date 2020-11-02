@@ -89,7 +89,7 @@ class Client:
                 check = waiter[1]
                 if check(*args, **kwargs):
                     waiter[0].set_result(*args, **kwargs)
-                del waiter
+                waiters.remove(waiter)
 
         func = getattr(self, f'on_{event}')  # TODO: Make this actually have a proper listener / event system
         await func(*args, **kwargs)
