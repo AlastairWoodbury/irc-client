@@ -15,9 +15,10 @@ async def main():
 
     await client.connect('')
     await client.join_channel('')
-    await client.send_message('', 'test')
+    channel = client.get_channel('')
+    await channel.send('Hi!')
     await asyncio.sleep(30)
     await client.close('Bye!')
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main(), debug=True)

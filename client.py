@@ -1,17 +1,19 @@
 import asyncio
 import logging
 import re
-from typing import Callable
+from typing import Any, Callable, Optional
 
+from channel import Channel
 from enums import Response
-from message import Message, ServerMessage
+from message import Message, PingMessage, ServerMessage
 
 __all__ = (
     'Client'
 )
 
-SERVER_MESSAGE_RE = re.compile(r':(?P<prefix>[\w\.]+) (?P<code>\d{3}) (?P<user>\w+) (?P<args>.+)?:(?P<params>.+)')
-MESSAGE_RE = re.compile(r':(?P<nick>.+)!(?P<username>.+)@(?P<host>.+) PRIVMSG (?P<channel>.+) :(?P<message>.+)')
+SERVER_MESSAGE_RE = re.compile(r':(?P<prefix>[\w\.]+) (?P<code>[^ ]+) (?P<user>[^ ]+) (?:(?P<args>.+) )?:(?P<params>.+)\r\n')
+MESSAGE_RE = re.compile(r':(?P<nick>.+)!(?P<username>.+)@(?P<host>.+) (?P<content>.+) (:?(?P<args>.+) )?:(?P<params>.+)\r\n')
+PING_RE = re.compile(r'PING :(?P<params>.+)\r\n')
 
 
 class Client:
@@ -29,6 +31,8 @@ class Client:
         self.loop = loop or asyncio.get_event_loop()
 
         self._waiters = {}
+        self._listensers = {}
+        self._channels = {}
 
         self.logger = logging.getLogger(__name__)
 
@@ -56,7 +60,8 @@ class Client:
         )
 
         self._recieve_task = self.loop.create_task(
-            self.recieve_loop()
+            self.recieve_loop(),
+            name='recieve'
         )
 
         password = password if password is not ... else self.password
@@ -64,20 +69,23 @@ class Client:
         nick = nick if nick is not ... else self.nick
 
         await self.set_nick(nick)
-        await self.send_command('USER', args=f'{username} * *', params='turtle')
+        await self.send_command(
+            'USER',
+            args=f'{username} * *',
+            params=password
+        )
 
-        def check(message: ServerMessage):
-            return message.code == Response(1)
-
-        await self.wait_for('server_message', check=check, timeout=10)
+        await self.wait_for(
+            'server_message',
+            check=lambda message: message.code == Response.RPL_WELCOME,
+            timeout=5
+        )
         self.logger.info('Logged in as %s', username)
 
     async def recieve_loop(self) -> None:
         while True:
             data = await self.reader.readuntil(b'\r\n')
-            self.loop.create_task(
-                self.handle_recieve(data)
-            )
+            await self.handle_recieve(data)
 
     async def handle_recieve(self, data: bytes) -> None:
         data = data.decode()
@@ -86,21 +94,40 @@ class Client:
     async def dispatch(self, event: str, *args, **kwargs) -> None:
         if waiters := self._waiters.get(event):
             for waiter in waiters:
-                check = waiter[1]
+                future, check = waiter
                 if check(*args, **kwargs):
-                    waiter[0].set_result(*args, **kwargs)
-                waiters.remove(waiter)
+                    future.set_result(*args, **kwargs)
+                    waiters.remove(waiter)
 
-        func = getattr(self, f'on_{event}')  # TODO: Make this actually have a proper listener / event system
-        await func(*args, **kwargs)
+        try:
+            func = getattr(self, f'on_{event}')  # TODO: Make this actually have a proper listener / event system
+        except AttributeError:
+            pass
+        else:
+            await func(*args, **kwargs)
+
+        if listeners := self._listensers.get(event):
+            for listener in listeners:
+                await listener(*args, **kwargs)
 
     async def wait_for(
         self,
         event: str,
         *,
-        timeout: int = None,
+        timeout: float = None,
         check: Callable = None
-    ) -> any:
+    ) -> Any:
+        '''Wait for an event to happen
+
+        Parameters:
+          - event: str - The event to wait for
+          - timout: float - The ammount of time to wait before raising `asyncio.TimeoutError`
+          - check: Callable - A callable to filter events
+
+        Raises:
+          - asyncio.TimeoutError
+        '''
+
         future = self.loop.create_future()
 
         if not self._waiters.get(event):
@@ -114,6 +141,41 @@ class Client:
         self._waiters[event].append((future, check))
         return await asyncio.wait_for(future, timeout)
 
+    async def accumulate(
+        self,
+        event: str,
+        *,
+        check: Callable = None,
+        final: Callable = None,
+        timeout: float = None
+    ) -> Any:
+        if check is None:
+            def _(*args, **kwargs) -> bool:
+                return True
+            check = _
+
+        if final is None:
+            def _(*args, **kwargs) -> bool:
+                return True
+            final = _
+
+        total = []
+        fut = self.loop.create_future()
+
+        async def _(*args, **kwargs):
+            if check(*args, **kwargs):
+                return total.append((args, kwargs))
+
+            if final(*args, **kwargs):
+                total.append((args, kwargs))
+                return fut.set_result(1)
+
+        self.add_listener(event, _)
+        await asyncio.wait_for(fut, timeout)
+        self.remove_listener(event, _)
+
+        return total
+
     async def send_command(
         self,
         command: str,
@@ -125,31 +187,96 @@ class Client:
         params = f':{params.strip()}' if params else ''
         message = f'{command.strip()} {args}{params}\r\n'
         logging.debug('Sent command %s', message.rstrip())
-        await self.send_raw(message.encode())
+        await self._send_raw(message.encode())
 
-    async def send_raw(self, data: bytes) -> None:
+    async def _send_raw(self, data: bytes) -> None:
         self.writer.write(data)
         await self.writer.drain()
 
-    async def on_raw_socket_recieve(self, message: str) -> None:
+    def add_listener(
+        self,
+        event: str,
+        coro: Callable
+    ) -> None:
+        if not asyncio.iscoroutinefunction(coro):
+            raise TypeError('Listener callback must be a coroutine')
 
-        if match := re.match(SERVER_MESSAGE_RE, message):  # Server message
-            match_dict = match.groupdict()
-            match_dict['code'] = int(match_dict['code'])
-            message = ServerMessage(**match_dict)
-            await self.dispatch('server_message', message)
+        if not self._listensers.get(event):
+            self._listensers[event] = set()
 
-        elif match := re.match(MESSAGE_RE, message):  # User message
-            await self.dispatch('message', Message(**match.groupdict()))
+        self._listensers[event].add(coro)
 
-        else:
-            self.logger.warning('Recieved an unknown event: %s', message.rstrip())
+        return coro
 
-    async def on_server_message(self, message):
-        self.logger.debug('Recieved server message %s', message)
+    def remove_listener(
+        self,
+        event: str,
+        coro: Callable
+    ) -> Callable:
+        if not asyncio.iscoroutinefunction(coro):
+            raise TypeError('Listener must be a coroutine')
 
-    async def on_message(self, message: Message) -> None:
-        self.logger.debug('[{0.created_at}] {0.channel} - {0.nick} | {0.message}'.format(message))
+        self._listensers[event].remove(coro)
+
+        return coro
+
+    # ~~ Listeners ~~ #
+
+    async def on_raw_socket_recieve(self, data: str) -> None:
+        if match := re.match(MESSAGE_RE, data):
+            await self.dispatch(
+                'message',
+                Message(data=match.groupdict())
+            )
+
+        elif match := re.match(SERVER_MESSAGE_RE, data):
+            await self.dispatch(
+                'server_message',
+                ServerMessage(data=match.groupdict())
+            )
+
+        elif match := re.match(PING_RE, data):
+            await self.dispatch(
+                'ping',
+                PingMessage(data=data)
+            )
+
+    async def on_ping(self, message: PingMessage) -> None:
+        logging.debug('Sending ping message to %s', message.server)
+        await self.send_command('PING', args=message.server)
+
+    async def on_server_message(self, message: ServerMessage) -> None:
+        ...
+
+    # ~~ Helper Methods ~~ #
+
+    async def set_nick(self, new_nick: str) -> None:
+        await self.send_command('NICK', args=new_nick)
+
+    async def join_channel(self, name: str) -> Channel:
+        await self.send_command('JOIN', args=name)
+
+        members = []
+
+        messages = await self.accumulate(
+            'server_message',
+            check=lambda message: message.code == Response.RPL_NAMREPLY,
+            final=lambda message: message.code == Response.RPL_ENDOFNAMES,
+            timeout=10
+        )
+        for message in messages:
+            if message[0][0].code == Response.RPL_NAMREPLY:
+                for member in message[0][0].params.split():
+                    members.append(member)
+
+        self._channels[name] = Channel(
+            name=name,
+            members=members,
+            client=self
+        )
+
+    async def send_message(self, channel: str, message: str) -> None:
+        await self.send_command('PRIVMSG', args=channel, params=message)
 
     async def close(self, reason: str = None) -> None:
         await self.send_command('QUIT', params=reason)
@@ -157,17 +284,8 @@ class Client:
         self.writer.close()
         await self.writer.wait_closed()
 
-    async def set_nick(self, new_nick: str) -> None:
-        await self.send_command('NICK', args=new_nick)
-
-    async def join_channel(self, name: str) -> None:
-        await self.send_command('JOIN', args=name)
-
-        def check(message: Message) -> bool:
-            return message.code == Response(353)
-
-        message = await self.wait_for('server_message', check=check)
-        self.logger.info('Joined %s with %s members', name, len(message.params.split()))
-
-    async def send_message(self, channel: str, message: str) -> None:
-        await self.send_command('PRIVMSG', args=channel, params=message)
+    def get_channel(
+        self,
+        channel: str
+    ) -> Optional[Channel]:
+        return self._channels.get(channel)
